@@ -28,6 +28,15 @@ class LLMSettings(BaseModel):
     api_type: str = Field(..., description="AzureOpenai or Openai")
     api_version: str = Field(..., description="Azure Openai version if AzureOpenai")
 
+    # ---- Optional: force the OpenAI token-budget parameter name --------------------
+    # None  -> auto-detect by model name (o1/o3/o4/gpt-5 -> max_completion_tokens)
+    # True  -> always send max_completion_tokens (and omit temperature)
+    # False -> always send max_tokens
+    use_max_completion_tokens: Optional[bool] = Field(
+        default=None,
+        description="Force max_completion_tokens vs max_tokens; None = auto-detect",
+    )
+
     # ---- Optional local-HuggingFace backend fields (api_type == "hf_local") -------
     device_map: Optional[str] = Field(
         default=None, description="HF device_map, e.g. 'auto'"
@@ -109,6 +118,7 @@ _OPTIONAL_LLM_KEYS = (
     "enable_thinking",
     "profile_cache",
     "profile_dir",
+    "use_max_completion_tokens",
 )
 
 
