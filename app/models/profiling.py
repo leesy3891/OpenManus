@@ -77,6 +77,9 @@ class ProfilingEvent:
     tool_success: Optional[bool] = None
     prompt_text: str = ""
     generated_text: str = ""
+    # main-call diagnostics (why a plan call produced nothing, etc.)
+    finish_reason: Optional[str] = None
+    tool_names: Optional[List[str]] = None
     # {(layer:int, kv_head:int): [float, ...]} mean-pooled V vector per layer/head
     v_cache_summary: Optional[Dict[Tuple[int, int], List[float]]] = field(default=None)
 
@@ -120,6 +123,8 @@ class ProfilingRecorder:
         output_tokens: int = 0,
         prompt_text: str = "",
         generated_text: str = "",
+        finish_reason: Optional[str] = None,
+        tool_names: Optional[List[str]] = None,
     ) -> ProfilingEvent:
         ev = ProfilingEvent(
             run_id=self.run_id,
@@ -135,6 +140,8 @@ class ProfilingRecorder:
             llm_latency_sec=float(latency),
             prompt_text=prompt_text or "",
             generated_text=generated_text or "",
+            finish_reason=finish_reason,
+            tool_names=list(tool_names) if tool_names else None,
         )
         self.events.append(ev)
         return ev
@@ -246,6 +253,16 @@ class ProfilingRecorder:
                     f"llm={ev.llm_latency_sec:.3f}s tool={ev.tool_latency_sec}"
                 )
                 f.write(header + "\n")
+                if ev.llm_type == "main":
+                    f.write(
+                        f"  finish_reason={ev.finish_reason} "
+                        f"tool_calls={ev.tool_names or []}\n"
+                    )
+                    if ev.finish_reason == "length" and not ev.tool_names:
+                        f.write(
+                            "  ** WARNING: hit the output-token ceiling before emitting "
+                            "a tool call. Increase max_tokens for this model. **\n"
+                        )
                 if ev.generated_text:
                     f.write("  generated (raw, incl. <think>):\n")
                     for line in ev.generated_text.splitlines():
@@ -254,6 +271,9 @@ class ProfilingRecorder:
 
     def _write_profiling_csv(self) -> None:
         path = self._path("profiling", "csv")
+        # NOTE: raw prompt_text / generated_text are intentionally NOT written here.
+        # They are large and already preserved verbatim in response/{run_id}.txt;
+        # duplicating them in the CSV bloats it and makes it hard to parse.
         columns = [
             "run_id",
             "step_index",
@@ -267,8 +287,7 @@ class ProfilingRecorder:
             "output_tokens_including_think",
             "llm_latency_sec",
             "tool_latency_sec",
-            "prompt_text",
-            "generated_text",
+            "finish_reason",
         ]
         with open(path, "w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
@@ -290,8 +309,7 @@ class ProfilingRecorder:
                         ""
                         if ev.tool_latency_sec is None
                         else f"{ev.tool_latency_sec:.6f}",
-                        ev.prompt_text,
-                        ev.generated_text,
+                        ev.finish_reason or "",
                     ]
                 )
 
