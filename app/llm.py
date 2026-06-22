@@ -40,7 +40,7 @@ class HuggingFaceChatCompletions:
             "Content-Type": "application/json"
         }
 
-    async def create(self, model, messages, temperature=0, max_completion_tokens=None, tools=None, tool_choice=None, timeout=None, **kwargs):
+    async def create(self, model, messages, temperature=0, max_tokens=None, tools=None, tool_choice=None, timeout=None, **kwargs):
         """Convert OpenAI-style request to Hugging Face format and handle the response."""
         # Convert messages to Hugging Face format, including tool descriptions if provided
         prompt = self._convert_messages_to_prompt(messages, tools)
@@ -53,7 +53,7 @@ class HuggingFaceChatCompletions:
             "inputs": prompt,
             "parameters": {
                 "temperature": hf_temperature,
-                "max_new_tokens": max_completion_tokens or 1024,
+                "max_new_tokens": max_tokens or 1024,
                 "return_full_text": False
             }
         }
@@ -271,7 +271,7 @@ class LLM:
             self.config_name = config_name
             self.llm_config = llm_config
             self.model = llm_config.model
-            self.max_completion_tokens = llm_config.max_completion_tokens
+            self.max_tokens = llm_config.max_tokens
             self.temperature = llm_config.temperature
             self.api_type = llm_config.api_type
             self.api_key = llm_config.api_key
@@ -395,9 +395,9 @@ class LLM:
             }
 
             if self.model in REASONING_MODELS:
-                params["max_completion_tokens"] = self.max_completion_tokens
+                params["max_tokens"] = self.max_tokens
             else:
-                params["max_completion_tokens"] = self.max_completion_tokens
+                params["max_tokens"] = self.max_tokens
                 params["temperature"] = temperature or self.temperature
 
             if not stream:
@@ -504,9 +504,9 @@ class LLM:
             }
 
             if self.model in REASONING_MODELS:
-                params["max_completion_tokens"] = self.max_completion_tokens
+                params["max_tokens"] = self.max_tokens
             else:
-                params["max_completion_tokens"] = self.max_completion_tokens
+                params["max_tokens"] = self.max_tokens
                 params["temperature"] = temperature or self.temperature
 
             start = time.time()
