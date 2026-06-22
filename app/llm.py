@@ -26,7 +26,30 @@ from app.schema import (
 from app.models.profiling import get_active_recorder
 
 
+# OpenAI "reasoning" style models require `max_completion_tokens` instead of
+# `max_tokens`, and reject a custom `temperature`. Exact names kept for back-compat;
+# prefixes catch newer variants (o1-*, o3-*, o4-*, gpt-5*).
 REASONING_MODELS = ["o1", "o3-mini"]
+REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+
+
+def _needs_max_completion_tokens(api_type: str, model: str, override=None) -> bool:
+    """Whether to send `max_completion_tokens` (vs `max_tokens`) for this model.
+
+    Priority:
+      1. explicit config flag `use_max_completion_tokens` (True/False) if set,
+      2. otherwise auto-detect by model name for OpenAI reasoning models.
+    The local HuggingFace backend only understands `max_tokens`, so it always
+    returns False.
+    """
+    if api_type == "hf_local":
+        return False
+    if override is not None:
+        return bool(override)
+    m = (model or "").lower()
+    if m in REASONING_MODELS:
+        return True
+    return m.startswith(REASONING_MODEL_PREFIXES)
 
 
 class HuggingFaceChatCompletions:
@@ -272,6 +295,9 @@ class LLM:
             self.llm_config = llm_config
             self.model = llm_config.model
             self.max_tokens = llm_config.max_tokens
+            self.use_max_completion_tokens = getattr(
+                llm_config, "use_max_completion_tokens", None
+            )
             self.temperature = llm_config.temperature
             self.api_type = llm_config.api_type
             self.api_key = llm_config.api_key
@@ -394,11 +420,16 @@ class LLM:
                 "messages": messages,
             }
 
-            if self.model in REASONING_MODELS:
-                params["max_tokens"] = self.max_tokens
+            if _needs_max_completion_tokens(
+                self.api_type, self.model, self.use_max_completion_tokens
+            ):
+                params["max_completion_tokens"] = self.max_tokens
+                # Reasoning models reject a custom temperature -> omit it.
             else:
                 params["max_tokens"] = self.max_tokens
-                params["temperature"] = temperature or self.temperature
+                params["temperature"] = (
+                    temperature if temperature is not None else self.temperature
+                )
 
             if not stream:
                 # Non-streaming request
@@ -503,11 +534,16 @@ class LLM:
                 **kwargs,
             }
 
-            if self.model in REASONING_MODELS:
-                params["max_tokens"] = self.max_tokens
+            if _needs_max_completion_tokens(
+                self.api_type, self.model, self.use_max_completion_tokens
+            ):
+                params["max_completion_tokens"] = self.max_tokens
+                # Reasoning models reject a custom temperature -> omit it.
             else:
                 params["max_tokens"] = self.max_tokens
-                params["temperature"] = temperature or self.temperature
+                params["temperature"] = (
+                    temperature if temperature is not None else self.temperature
+                )
 
             start = time.time()
             response = await self.client.chat.completions.create(**params)
