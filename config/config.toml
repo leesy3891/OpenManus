@@ -6,20 +6,20 @@
 # Main orchestration LLM (API-based, used by PlanningFlow.llm via config_name="default")
 [llm]
 api_type = "openai"
-model = "gpt-4o"
+model = "gpt-5"
 base_url = "https://api.openai.com/v1"
 api_key = "sk-..."
 max_tokens = 4096
-temperature = 0.0
+temperature = 0.6
 
 # Local HuggingFace profiled sub-LLM (used by ProfiledExecutorAgent via config_name="profiled_qwen")
 [llm.profiled_qwen]
 api_type = "hf_local"
-model = "Qwen/Qwen3-32B"
+model = "Qwen/Qwen3-14B"
 base_url = ""
 api_key = ""
-max_tokens = 2048
-temperature = 0.0
+max_tokens = 4096
+temperature = 0.6
 device_map = "auto"
 torch_dtype = "bfloat16"
 load_in_4bit = false
