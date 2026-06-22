@@ -348,6 +348,22 @@ class LLM:
                     gen = (message.content or "") if message is not None else ""
                 except Exception:
                     gen = ""
+                # finish_reason + any tool-call names, so an empty/length-capped
+                # planning call is visible in the records instead of silent.
+                finish_reason = None
+                tool_names = None
+                try:
+                    choices = getattr(response, "choices", None)
+                    if choices:
+                        finish_reason = getattr(choices[0], "finish_reason", None)
+                except Exception:
+                    finish_reason = None
+                try:
+                    tcs = getattr(message, "tool_calls", None) if message else None
+                    if tcs:
+                        tool_names = [tc.function.name for tc in tcs]
+                except Exception:
+                    tool_names = None
                 recorder.record_main_llm(
                     agent_name=self.config_name,
                     model=self.model,
@@ -355,6 +371,8 @@ class LLM:
                     input_tokens=in_tok,
                     output_tokens=out_tok,
                     generated_text=gen,
+                    finish_reason=finish_reason,
+                    tool_names=tool_names,
                 )
         except Exception as e:
             logger.warning(f"[profiling] failed to record LLM call: {e}")
