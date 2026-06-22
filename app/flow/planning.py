@@ -5,9 +5,16 @@ from typing import Dict, List, Optional, Union
 from pydantic import Field
 
 from app.agent.base import BaseAgent
+from app.config import config
 from app.flow.base import BaseFlow, PlanStepStatus
 from app.llm import LLM
 from app.logger import logger
+from app.models.profiling import (
+    ProfilingRecorder,
+    clear_active_recorder,
+    get_active_recorder,
+    set_active_recorder,
+)
 from app.schema import AgentState, Message, ToolChoice
 from app.tool import PlanningTool
 
@@ -61,11 +68,28 @@ class PlanningFlow(BaseFlow):
         # Fallback to primary agent
         return self.primary_agent
 
+    @staticmethod
+    def _resolve_profile_dir() -> str:
+        """Pick the profiling output dir from the sub-LLM config if available."""
+        try:
+            sub_cfg = config.llm.get("profiled_qwen")
+            if sub_cfg and getattr(sub_cfg, "profile_dir", None):
+                return sub_cfg.profile_dir
+        except Exception:
+            pass
+        return "record"
+
     async def execute(self, input_text: str) -> str:
-        """Execute the planning flow with agents."""
+        """Execute the planning flow with agents (with profiling)."""
+        recorder: Optional[ProfilingRecorder] = None
         try:
             if not self.primary_agent:
                 raise ValueError("No primary agent available")
+
+            # ---- start profiling run ----
+            recorder = ProfilingRecorder(profile_dir=self._resolve_profile_dir())
+            recorder.start_run(input_text)
+            set_active_recorder(recorder)
 
             # Create initial plan if input provided
             if input_text:
@@ -102,6 +126,14 @@ class PlanningFlow(BaseFlow):
         except Exception as e:
             logger.error(f"Error in PlanningFlow: {str(e)}")
             return f"Execution failed: {str(e)}"
+        finally:
+            # ---- finalize profiling run ----
+            if recorder is not None:
+                try:
+                    recorder.finalize()
+                except Exception as e:
+                    logger.error(f"[profiling] finalize failed: {e}")
+                clear_active_recorder()
 
     async def _create_initial_plan(self, request: str) -> None:
         """Create an initial plan based on the request using the flow's LLM and PlanningTool."""
@@ -119,7 +151,7 @@ class PlanningFlow(BaseFlow):
             f"Create a reasonable plan with clear steps to accomplish the task: {request}"
         )
 
-        # Call LLM with PlanningTool
+        # Call LLM with PlanningTool (main API LLM -> recorded as llm_type="main")
         response = await self.llm.ask_tool(
             messages=[user_message],
             system_msgs=[system_message],
@@ -231,6 +263,14 @@ class PlanningFlow(BaseFlow):
         # Prepare context for the agent with current plan status
         plan_status = await self._get_plan_text()
         step_text = step_info.get("text", f"Step {self.current_step_index}")
+
+        # ---- record the stepwise task before passing it to the executor ----
+        recorder = get_active_recorder()
+        if recorder is not None:
+            try:
+                recorder.start_step(self.current_step_index, step_text)
+            except Exception as e:
+                logger.warning(f"[profiling] failed to record step: {e}")
 
         # Create a prompt for the agent to execute the current step
         step_prompt = f"""
