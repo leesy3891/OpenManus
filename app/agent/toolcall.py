@@ -1,10 +1,12 @@
 import json
+import time
 from typing import Any, List, Optional, Union
 
 from pydantic import Field
 
 from app.agent.react import ReActAgent
 from app.logger import logger
+from app.models.profiling import get_active_recorder
 from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
@@ -141,9 +143,18 @@ class ToolCallAgent(ReActAgent):
             # Parse arguments
             args = json.loads(command.function.arguments or "{}")
 
-            # Execute the tool
+            # Execute the tool (with latency instrumentation for profiling)
             logger.info(f"🔧 Activating tool: '{name}'...")
+            recorder = get_active_recorder()
+            _t0 = time.time()
             result = await self.available_tools.execute(name=name, tool_input=args)
+            tool_latency = time.time() - _t0
+            if recorder is not None:
+                success = not bool(getattr(result, "error", None))
+                try:
+                    recorder.record_tool_latency(name, tool_latency, success=success)
+                except Exception as e:
+                    logger.warning(f"[profiling] failed to record tool latency: {e}")
 
             # Format result for display
             observation = (
