@@ -28,6 +28,30 @@ class LLMSettings(BaseModel):
     api_type: str = Field(..., description="AzureOpenai or Openai")
     api_version: str = Field(..., description="Azure Openai version if AzureOpenai")
 
+    # ---- Optional local-HuggingFace backend fields (api_type == "hf_local") -------
+    device_map: Optional[str] = Field(
+        default=None, description="HF device_map, e.g. 'auto'"
+    )
+    torch_dtype: Optional[str] = Field(
+        default=None, description="torch dtype: bfloat16 | float16 | float32 | auto"
+    )
+    load_in_4bit: bool = Field(default=False, description="Load model in 4-bit (bitsandbytes)")
+    load_in_8bit: bool = Field(default=False, description="Load model in 8-bit (bitsandbytes)")
+    attn_implementation: Optional[str] = Field(
+        default=None, description="HF attn implementation, e.g. 'eager'"
+    )
+    enable_thinking: bool = Field(
+        default=False, description="Enable Qwen <think> chat-template mode"
+    )
+
+    # ---- Optional profiling fields ------------------------------------------------
+    profile_cache: bool = Field(
+        default=False, description="Collect KV/V-cache summaries for this LLM"
+    )
+    profile_dir: Optional[str] = Field(
+        default="record", description="Output directory for profiling artifacts"
+    )
+
 
 class ProxySettings(BaseModel):
     server: str = Field(None, description="Proxy server address")
@@ -72,6 +96,20 @@ class AppConfig(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+
+
+# Optional keys that may appear in a per-model [llm.xxx] override and should be
+# carried through to LLMSettings. Defaults are handled by the model itself.
+_OPTIONAL_LLM_KEYS = (
+    "device_map",
+    "torch_dtype",
+    "load_in_4bit",
+    "load_in_8bit",
+    "attn_implementation",
+    "enable_thinking",
+    "profile_cache",
+    "profile_dir",
+)
 
 
 class Config:
@@ -126,6 +164,11 @@ class Config:
             "api_type": base_llm.get("api_type", ""),
             "api_version": base_llm.get("api_version", ""),
         }
+
+        # Carry through any optional local-HF / profiling keys present at the top level.
+        for key in _OPTIONAL_LLM_KEYS:
+            if key in base_llm:
+                default_settings[key] = base_llm[key]
 
         # handle browser config.
         browser_config = raw_config.get("browser", {})
