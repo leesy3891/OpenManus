@@ -80,6 +80,8 @@ class ProfilingEvent:
     # main-call diagnostics (why a plan call produced nothing, etc.)
     finish_reason: Optional[str] = None
     tool_names: Optional[List[str]] = None
+    # raw input token ids (for input-overlap analysis between compared calls)
+    input_token_ids: Optional[List[int]] = field(default=None)
     # {(layer:int, kv_head:int): [float, ...]} mean-pooled V vector per layer/head
     v_cache_summary: Optional[Dict[Tuple[int, int], List[float]]] = field(default=None)
 
@@ -174,6 +176,7 @@ class ProfilingRecorder:
             prompt_text=profiling.get("prompt_text", "") or "",
             generated_text=profiling.get("generated_text", "") or "",
             v_cache_summary=profiling.get("v_cache_summary"),
+            input_token_ids=profiling.get("input_token_ids"),
         )
         self.events.append(ev)
         self.current_sub_event = ev
@@ -324,12 +327,33 @@ class ProfilingRecorder:
         with open(path, "w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
             w.writerow(
-                ["run_id", "tool_a", "call_a", "tool_b", "call_b", "layer", "head", "l2", "cosine"]
+                [
+                    "run_id", "tool_a", "call_a", "tool_b", "call_b",
+                    "layer", "head", "l2", "cosine",
+                    # input-overlap of the two compared calls (contiguous runs >= 3 tokens)
+                    "input_tokens_a", "input_tokens_b", "overlap_tokens",
+                    "overlap_pct_a", "overlap_pct_b",
+                ]
             )
             for i in range(len(cache_events)):
                 for j in range(i + 1, len(cache_events)):
                     a = cache_events[i]
                     b = cache_events[j]
+
+                    # --- input-token overlap (computed once per pair) ---------------
+                    na = len(a.input_token_ids) if a.input_token_ids else 0
+                    nb = len(b.input_token_ids) if b.input_token_ids else 0
+                    if na and nb:
+                        overlap = self._contiguous_overlap(
+                            a.input_token_ids, b.input_token_ids, min_run=3
+                        )
+                        pct_a = f"{100.0 * overlap / na:.2f}"
+                        pct_b = f"{100.0 * overlap / nb:.2f}"
+                        overlap_s = str(overlap)
+                    else:
+                        # token ids unavailable (e.g. older run) -> leave blank
+                        overlap_s = pct_a = pct_b = ""
+
                     common = set(a.v_cache_summary.keys()) & set(b.v_cache_summary.keys())
                     for (layer, head) in sorted(common):
                         l2, cos = self._compare_vectors(
@@ -347,8 +371,33 @@ class ProfilingRecorder:
                                 head,
                                 f"{l2:.6f}",
                                 f"{cos:.6f}",
+                                na,
+                                nb,
+                                overlap_s,
+                                pct_a,
+                                pct_b,
                             ]
                         )
+
+    @staticmethod
+    def _contiguous_overlap(a_ids: List[int], b_ids: List[int], min_run: int = 3) -> int:
+        """Number of tokens that lie in a contiguous run of length >= min_run that
+        appears identically (same order) in both token-id sequences.
+
+        Uses difflib's non-overlapping matching blocks (autojunk disabled so that
+        common tokens are not dropped) and sums the sizes of blocks of length
+        >= min_run. The count is symmetric: each matched block contributes `size`
+        tokens to both sequences, so it is divided by each side's own length to get
+        the two overlap percentages.
+        """
+        from difflib import SequenceMatcher
+
+        sm = SequenceMatcher(a=a_ids, b=b_ids, autojunk=False)
+        total = 0
+        for block in sm.get_matching_blocks():
+            if block.size >= min_run:
+                total += block.size
+        return total
 
     @staticmethod
     def _compare_vectors(va: List[float], vb: List[float]) -> Tuple[float, float]:
