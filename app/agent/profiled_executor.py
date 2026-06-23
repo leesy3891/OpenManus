@@ -12,13 +12,32 @@ from pydantic import Field
 
 from app.agent.toolcall import ToolCallAgent
 from app.llm import LLM
-from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
+from app.prompt.manus import NEXT_STEP_PROMPT as _MANUS_NEXT_STEP_PROMPT
+from app.prompt.manus import SYSTEM_PROMPT
 from app.tool import Terminate, ToolCollection
 from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.file_creator_viewer import FileCreatorViewer
 from app.tool.file_saver import FileSaver
 from app.tool.python_execute import PythonExecute
 from app.tool.web_search import WebSearch
+
+
+# Reinforce termination behaviour for the profiled executor WITHOUT touching the
+# shared Manus prompt. In OpenManus the loop ends ONLY when the `terminate` tool is
+# called; declaring completion in natural language does not stop execution. Qwen3
+# tends to announce "task complete" in prose (selecting 0 tools), which — combined
+# with the structural early-exit fix — would otherwise burn plan steps needlessly.
+_TERMINATE_REMINDER = """
+
+IMPORTANT — how to finish:
+- The ONLY way to end the task is to call the `terminate` tool. Saying the task is
+  done in natural language does NOT stop execution.
+- As soon as you have produced the final answer (or if you genuinely cannot make
+  further progress), you MUST immediately call the `terminate` tool:
+  use status="success" when the task is solved, status="failure" otherwise.
+- Do not keep repeating a tool call that is not making progress. If you are stuck,
+  call `terminate` with status="failure" instead of looping.
+"""
 
 
 class ProfiledExecutorAgent(ToolCallAgent):
@@ -34,7 +53,8 @@ class ProfiledExecutorAgent(ToolCallAgent):
     )
 
     system_prompt: str = SYSTEM_PROMPT
-    next_step_prompt: str = NEXT_STEP_PROMPT
+    # Profiled-executor-specific next-step prompt: Manus prompt + terminate reminder.
+    next_step_prompt: str = _MANUS_NEXT_STEP_PROMPT + _TERMINATE_REMINDER
 
     # Local HuggingFace sub-LLM (Qwen/Qwen3-32B via [llm.profiled_qwen]).
     llm: LLM = Field(default_factory=lambda: LLM(config_name="profiled_qwen"))
@@ -62,4 +82,5 @@ class ProfiledExecutorAgent(ToolCallAgent):
 
 
 # Backward-compatible alias mentioned in the spec.
+ProfiledToolCallAgent = ProfiledExecutorAgent
 ProfiledManusExecutor = ProfiledExecutorAgent
