@@ -39,6 +39,17 @@ class BaseAgent(BaseModel, ABC):
     max_steps: int = Field(default=10, description="Maximum steps before termination")
     current_step: int = Field(default=0, description="Current step in execution")
 
+    # Persistent termination signal.
+    # `state` is transient: BaseAgent.run() runs inside a `state_context` whose
+    # `finally` reverts the agent to its previous (IDLE) state on exit, which would
+    # otherwise erase the FINISHED state set by the `terminate` tool. This flag is
+    # NOT reverted by that teardown, so callers such as PlanningFlow can reliably
+    # observe that the agent finished via `terminate` after run() returns.
+    terminated: bool = Field(
+        default=False,
+        description="True once the agent finished via the `terminate` special tool",
+    )
+
     duplicate_threshold: int = 2
 
     class Config:
@@ -78,7 +89,12 @@ class BaseAgent(BaseModel, ABC):
             self.state = AgentState.ERROR  # Transition to ERROR on failure
             raise e
         finally:
-            self.state = previous_state  # Revert to previous state
+            # Preserve a terminal FINISHED state so that callers (e.g. PlanningFlow)
+            # can observe that the agent stopped via the `terminate` tool. Any other
+            # state is reverted to what it was before entering the context, which is
+            # the original behaviour for the normal (non-terminating) path.
+            if self.state != AgentState.FINISHED:
+                self.state = previous_state
 
     def update_memory(
         self,
@@ -122,8 +138,19 @@ class BaseAgent(BaseModel, ABC):
         Raises:
             RuntimeError: If the agent is not in IDLE state at start.
         """
+        # Allow re-running an agent that previously finished via `terminate`.
+        # PlanningFlow reuses one executor instance across plan steps, so after a
+        # FINISHED run we normalise back to IDLE here. PlanningFlow inspects the
+        # persistent `terminated` flag (and FINISHED state) BEFORE calling run()
+        # again, so this reset never hides a termination from the flow.
+        if self.state == AgentState.FINISHED:
+            self.state = AgentState.IDLE
+
         if self.state != AgentState.IDLE:
             raise RuntimeError(f"Cannot run agent from state: {self.state}")
+
+        # Start each run from a clean termination signal.
+        self.terminated = False
 
         if request:
             self.update_memory("user", request)
