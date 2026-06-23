@@ -1,6 +1,6 @@
 """
 Profiled runner: API main orchestration (PlanningFlow) + local-HF sub-LLM execution,
-with optional GAIA benchmark driving.
+with optional GAIA benchmark driving (camel-free).
 
 Two run modes
 -------------
@@ -8,19 +8,24 @@ Two run modes
        python main_profiled.py
        python main_profiled.py --prompt "your task"
 
-2) GAIA benchmark:
-       python main_profiled.py --gaia --data-dir /path/to/GAIA --on valid --level all
-       python main_profiled.py --gaia --data-dir /path/to/GAIA --start 0 --end 10
-       python main_profiled.py --gaia --data-dir /path/to/GAIA --level 2 --start 0 --end 5
+2) GAIA benchmark (no camel required):
+       python main_profiled.py --gaia --on valid --level all
+       python main_profiled.py --gaia --on valid --start 0 --end 10
+       python main_profiled.py --gaia --on valid --level 1 --start 0 --end 5
 
 Benchmark selection semantics (the two requested features)
 ----------------------------------------------------------
-* --level {1,2,3,all}:  first EXTRACT only the test cases of that level
-                        (level="all" keeps every level). This is feature #2.
-* --start / --end:      then SLICE the (level-filtered) list as tasks[start:end],
-                        i.e. run exactly (end - start) test cases. This is feature #1.
+* --level {1,2,3,all}:  EXTRACT only the test cases of that level. GAIA ships per-level
+                        HF configs, so this is just config selection
+                        (level n -> "2023_level{n}", all -> "2023_all"). Feature #2.
+* --start / --end:      then SLICE the (level-filtered) list as tasks[start:end], i.e.
+                        run exactly (end - start) test cases. Feature #1.
   The two compose: with a specific --level you get "this level only, run 1..N of them";
   with --level all you get a plain global [start:end] slice over the whole split.
+
+Dataset comes straight from the Hugging Face hub via `datasets.load_dataset`
+("gaia-benchmark/GAIA"). It is gated: run `huggingface-cli login` once and accept the
+terms on the dataset page. No CAMEL/OWL dependency is used anywhere on this path.
 
 Output / profiling contract (kept intact)
 ------------------------------------------
@@ -29,12 +34,6 @@ behaviour is preserved 1:1 -- every task produces one timestamp run_id and one s
     {profile_dir}/{response,profiling,tool_compare}/{run_id}.*
 files (written by app/flow/planning.py's recorder lifecycle). This runner only adds
 benchmark driving + scoring on top; it does NOT touch main.py / Manus().run().
-
-GAIA's own run()/run_role_playing()/run_workforce_with_retry() are CAMEL-specific
-(they drive a camel ChatAgent / Workforce), so they are intentionally NOT used here.
-We reuse only the dataset-loading + scoring helpers from utils.gaia.GAIABenchmark:
-    _load_tasks, _prepare_task, question_scorer, _save_results_to_file, _generate_summary
-and feed each task's Question into the OpenManus PlanningFlow.
 """
 
 import argparse
@@ -45,6 +44,7 @@ from app.agent.profiled_executor import ProfiledExecutorAgent
 from app.flow.planning import PlanningFlow
 from app.llm import LLM
 from app.logger import logger
+from app.schema import Message
 
 
 # --------------------------------------------------------------------------------------
@@ -67,9 +67,8 @@ def build_flow(main_llm: LLM, plan_id: Optional[str] = None) -> PlanningFlow:
         executors=["profiled_executor"],
     )
     if plan_id is not None:
-        # PlanningFlow.__init__ accepts plan_id and maps it onto active_plan_id.
-        # Explicit per-task plan_id avoids the time.time() collision when two tasks
-        # start within the same second.
+        # PlanningFlow.__init__ accepts plan_id -> active_plan_id. Explicit per-task
+        # plan_id avoids the time.time() collision when two tasks start in the same second.
         data["plan_id"] = plan_id
 
     return PlanningFlow(**data)
@@ -98,10 +97,9 @@ async def run_single(main_llm: LLM, prompt: Optional[str]) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# GAIA benchmark mode
+# GAIA benchmark mode (camel-free)
 # --------------------------------------------------------------------------------------
 def _parse_level(raw: str) -> Union[int, str]:
-    """argparse string -> _load_tasks() level argument (int or 'all')."""
     raw = str(raw).strip().lower()
     if raw == "all":
         return "all"
@@ -113,77 +111,83 @@ def _parse_level(raw: str) -> Union[int, str]:
         )
 
 
-def _load_gaia_tasks(
-    benchmark,
-    on: str,
-    level: Union[int, str],
-    start: int,
-    end: Optional[int],
+def _slice_tasks(
+    tasks: List[Dict[str, Any]], start: int, end: Optional[int]
 ) -> List[Dict[str, Any]]:
-    """Load -> level-filter -> [start:end] slice.
-
-    Feature #2 (level extraction) is handled by GAIABenchmark._load_tasks(level=...).
-    Feature #1 (count via slicing) is the tasks[start:end] applied afterwards.
-    """
-    # level filter happens inside _load_tasks; randomize/subset/idx left at defaults so
-    # the ordering is stable and our [start:end] slice is reproducible.
-    tasks = benchmark._load_tasks(
-        on=on, level=level, randomize=False, subset=None, idx=None
-    )
-
+    """tasks[start:end] with clamping. (Feature #1; level already applied by config.)"""
     total = len(tasks)
     start = max(0, start)
     end = total if end is None else min(end, total)
     if start >= end:
-        logger.warning(
-            f"Empty task slice: start={start}, end={end}, level-filtered total={total}."
-        )
+        logger.warning(f"Empty task slice: start={start}, end={end}, total={total}.")
         return []
-
     sliced = tasks[start:end]
     logger.info(
-        f"GAIA: on={on} level={level} -> {total} tasks after level filter; "
-        f"running [{start}:{end}] = {len(sliced)} tasks."
+        f"GAIA: {total} tasks after level filter; running [{start}:{end}] "
+        f"= {len(sliced)} tasks."
     )
     return sliced
 
 
+async def _formalize_answer(main_llm: LLM, question: str, raw_answer: str) -> str:
+    """Normalise a raw answer into GAIA's strict format using the API main LLM.
+
+    Replaces gaia.py's camel-based get_formal_answer: we reuse the existing API LLM
+    (config_name="default") instead of pulling in camel's ModelFactory.
+    """
+    from gaia_bench import FORMAL_ANSWER_PROMPT
+
+    prompt = FORMAL_ANSWER_PROMPT.format(question=question, text=raw_answer)
+    resp = await main_llm.ask(
+        messages=[Message.user_message(prompt)],
+        stream=False,
+        temperature=0.0,
+    )
+    return (resp or raw_answer).strip()
+
+
 async def run_gaia(main_llm: LLM, args: argparse.Namespace) -> None:
-    # Imported lazily: utils.gaia pulls in CAMEL/OWL deps that single-prompt mode
-    # does not need, so we only require them when --gaia is actually requested.
     try:
-        from utils.gaia import GAIABenchmark
-    except Exception as e:  # pragma: no cover - depends on user env
+        from gaia_bench import GaiaTasks
+    except ImportError as e:
+        logger.error(f"Failed to import gaia_bench ({e}).")
+        return
+
+    level = _parse_level(args.level)
+
+    if args.on == "test":
+        logger.warning(
+            "GAIA 'test' split has hidden ground-truth answers; scores will not be "
+            "meaningful (use it only to produce leaderboard submissions)."
+        )
+
+    gaia = GaiaTasks(level=level, split=args.on, save_to=args.save_to)
+
+    try:
+        all_tasks = gaia.load()
+    except Exception as e:
         logger.error(
-            f"Failed to import utils.gaia.GAIABenchmark ({e}). "
-            f"Make sure utils/gaia.py and its dependencies are importable."
+            f"Failed to load GAIA dataset (config={gaia.config}, split={gaia.split}): {e}. "
+            f"Ensure `pip install datasets` and `huggingface-cli login` (gated dataset)."
         )
         return
 
-    benchmark = GAIABenchmark(
-        data_dir=args.data_dir,
-        save_to=args.save_to,
-        processes=1,
-    )
-
-    level = _parse_level(args.level)
-    tasks = _load_gaia_tasks(benchmark, args.on, level, args.start, args.end)
+    tasks = _slice_tasks(all_tasks, args.start, args.end)
     if not tasks:
         print("\n========== GAIA SUMMARY ==========")
         print("No tasks to run for the given level/slice.")
         return
 
-    # Fresh results list for this run (we drive scoring ourselves, not benchmark.run()).
-    benchmark._results = []
+    results: List[Dict[str, Any]] = []
 
     for i, task in enumerate(tasks):
         task_id = task.get("task_id")
-        # _prepare_task enriches task["Question"] with any attached file paths (and
-        # tells us to skip if a referenced file is missing), exactly as benchmark.run does.
-        ok, info = benchmark._prepare_task(task)
+
+        # Enrich Question with any attached-file hint (skip if a referenced file is gone).
+        ok, info = gaia.prepare_task(task)
         if not ok:
             logger.warning(f"[{i}] Skipping task {task_id}: {info}")
-            benchmark._results.append(
+            results.append(
                 {
                     "task_id": task_id,
                     "question": task.get("Question"),
@@ -210,14 +214,11 @@ async def run_gaia(main_llm: LLM, args: argparse.Namespace) -> None:
         try:
             raw_answer = await flow.execute(question)
 
-            # By default we score the raw flow output. With --formal we additionally
-            # normalise it into GAIA's strict answer format via the benchmark's own
-            # GPT-4o reformatter (requires the camel OpenAI backend to be configured).
             if args.formal and raw_answer:
                 try:
-                    answer = benchmark.get_formal_answer(question, raw_answer)
+                    answer = await _formalize_answer(main_llm, question, raw_answer)
                 except Exception as e:
-                    logger.error(f"get_formal_answer failed, using raw answer: {e}")
+                    logger.error(f"Formalisation failed, using raw answer: {e}")
                     answer = raw_answer
             else:
                 answer = raw_answer
@@ -227,17 +228,19 @@ async def run_gaia(main_llm: LLM, args: argparse.Namespace) -> None:
         ground_truth = task.get("Final answer")
         try:
             score = (
-                benchmark.question_scorer(answer, ground_truth)
-                if answer is not None
+                gaia.question_scorer(answer, ground_truth)
+                if answer is not None and ground_truth is not None
                 else False
             )
         except Exception as e:
             logger.error(f"Scoring failed for task {task_id}: {e}")
             score = False
 
-        logger.info(f"Task {task_id} -> answer={answer!r} gt={ground_truth!r} score={score}")
+        logger.info(
+            f"Task {task_id} -> answer={answer!r} gt={ground_truth!r} score={score}"
+        )
 
-        benchmark._results.append(
+        results.append(
             {
                 "task_id": task_id,
                 "question": question,
@@ -252,23 +255,24 @@ async def run_gaia(main_llm: LLM, args: argparse.Namespace) -> None:
         # Persist incrementally so a crash mid-run still leaves partial results.
         if args.save_to:
             try:
-                benchmark._save_results_to_file(benchmark._results, benchmark.save_to)
+                gaia.save_results(results, gaia.save_to)
             except Exception as e:
-                logger.warning(f"Failed to save results to {benchmark.save_to}: {e}")
+                logger.warning(f"Failed to save results to {gaia.save_to}: {e}")
 
-    # Final summary using the benchmark's own aggregator (total / correct / accuracy).
-    summary = benchmark._generate_summary()
+    summary = gaia.summary(results)
     print("\n========== GAIA SUMMARY ==========")
-    print(f"on        : {args.on}")
-    print(f"level     : {level}")
+    print(f"on        : {gaia.split}")
+    print(f"level     : {level}  (config={gaia.config})")
     print(f"slice     : [{args.start}:{args.end}]")
     print(f"total     : {summary['total']}")
     print(f"correct   : {summary['correct']}")
     print(f"accuracy  : {summary['accuracy']:.4f}")
     if args.save_to:
-        print(f"results   : {benchmark.save_to}")
-    print("profiling : per-task artifacts under the profiler's record dir "
-          "(one run_id per task).")
+        print(f"results   : {gaia.save_to}")
+    print(
+        "profiling : per-task artifacts under the profiler's record dir "
+        "(one run_id per task)."
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -280,7 +284,6 @@ def parse_args() -> argparse.Namespace:
         "with optional GAIA benchmark driving."
     )
 
-    # Mode / single-prompt
     p.add_argument(
         "--gaia",
         action="store_true",
@@ -295,29 +298,17 @@ def parse_args() -> argparse.Namespace:
 
     # GAIA options
     p.add_argument(
-        "--data-dir",
-        type=str,
-        default="data/gaia",
-        help="GAIA dataset directory (passed to GAIABenchmark).",
-    )
-    p.add_argument(
-        "--save-to",
-        type=str,
-        default="record/gaia_results.json",
-        help="Where to write the GAIA results JSON.",
-    )
-    p.add_argument(
         "--on",
         type=str,
         default="valid",
-        choices=["valid", "test"],
-        help="Which GAIA split to run.",
+        choices=["valid", "validation", "test"],
+        help="Which GAIA split to run (valid==validation).",
     )
     p.add_argument(
         "--level",
         type=str,
         default="all",
-        help="GAIA level to extract: 1, 2, 3, or all (feature #2).",
+        help="GAIA level to extract: 1, 2, 3, or all (feature #2). Selects the HF config.",
     )
     p.add_argument(
         "--start",
@@ -332,10 +323,15 @@ def parse_args() -> argparse.Namespace:
         help="End index (exclusive) of the [start:end] slice; default = run to the end.",
     )
     p.add_argument(
+        "--save-to",
+        type=str,
+        default="record/gaia_results.json",
+        help="Where to write the GAIA results JSON.",
+    )
+    p.add_argument(
         "--formal",
         action="store_true",
-        help="Normalise each answer into GAIA's strict format via "
-        "GAIABenchmark.get_formal_answer (needs the camel OpenAI backend).",
+        help="Normalise each answer into GAIA's strict format using the API main LLM.",
     )
 
     return p.parse_args()
