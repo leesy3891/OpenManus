@@ -118,8 +118,17 @@ class PlanningFlow(BaseFlow):
                 step_result = await self._execute_step(executor, step_info)
                 result += step_result + "\n"
 
-                # Check if agent wants to terminate
-                if hasattr(executor, "state") and executor.state == AgentState.FINISHED:
+                # Check if the executor signalled termination (e.g. via the
+                # `terminate` tool). We check the persistent `terminated` flag in
+                # addition to state == FINISHED, because BaseAgent.run()'s
+                # state_context reverts the transient state on exit.
+                if getattr(executor, "terminated", False) or (
+                    hasattr(executor, "state")
+                    and executor.state == AgentState.FINISHED
+                ):
+                    logger.info(
+                        "Executor signalled termination; ending PlanningFlow early."
+                    )
                     break
 
             return result
