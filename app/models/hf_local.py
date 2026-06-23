@@ -220,6 +220,8 @@ class LocalHFClient:
 
         enc = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
         input_len = int(enc.input_ids.shape[1])
+        # raw input token ids (for input-overlap analysis in tool_compare)
+        input_token_ids = enc.input_ids[0].tolist()
 
         gen_kwargs = dict(
             max_new_tokens=max_tokens,
@@ -270,6 +272,7 @@ class LocalHFClient:
             "prompt_text": prompt_text,
             "v_cache_summary": v_cache_summary,
             "selected_tool": selected_tool,
+            "input_token_ids": input_token_ids,
         }
         usage = _Usage(prompt_tokens=input_len, completion_tokens=output_tokens_including_think)
         return _Response([_Choice(message)], usage=usage)
