@@ -148,7 +148,7 @@ async def _formalize_answer(main_llm: LLM, question: str, raw_answer: str) -> st
 
 async def run_gaia(main_llm: LLM, args: argparse.Namespace) -> None:
     try:
-        from gaia_bench import GaiaTasks
+        from utils.gaia_bench import GaiaTasks
     except ImportError as e:
         logger.error(f"Failed to import gaia_bench ({e}).")
         return
