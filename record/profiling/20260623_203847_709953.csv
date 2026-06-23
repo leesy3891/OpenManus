@@ -1,0 +1,8 @@
+run_id,step_index,call_index,agent_name,llm_type,model,selected_tool,input_tokens,output_tokens,output_tokens_including_think,llm_latency_sec,tool_latency_sec,finish_reason
+20260623_203847_709953,,,default,main,gpt-5,,434,1084,1084,13.964788,,tool_calls
+20260623_203847_709953,0,0,profiled_qwen,sub,Qwen/Qwen3-14B,web_search,1916,44,273,19.176522,0.319832,
+20260623_203847_709953,0,1,profiled_qwen,sub,Qwen/Qwen3-14B,web_search,2532,40,751,50.444062,0.282280,
+20260623_203847_709953,0,2,profiled_qwen,sub,Qwen/Qwen3-14B,web_search,3144,44,693,51.523854,0.280978,
+20260623_203847_709953,0,3,profiled_qwen,sub,Qwen/Qwen3-14B,web_search,3761,43,681,52.510744,0.339495,
+20260623_203847_709953,0,4,profiled_qwen,sub,Qwen/Qwen3-14B,terminate,4377,77,433,37.242957,,
+20260623_203847_709953,0,5,profiled_qwen,sub,Qwen/Qwen3-14B,terminate,5046,23,283,29.820834,0.000080,
