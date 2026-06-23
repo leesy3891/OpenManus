@@ -187,6 +187,9 @@ class ToolCallAgent(ReActAgent):
             # Set agent state to finished
             logger.info(f"🏁 Special tool '{name}' has completed the task!")
             self.state = AgentState.FINISHED
+            # Persist a termination signal that survives BaseAgent.run()'s
+            # state_context teardown, so PlanningFlow can stop the whole flow.
+            self.terminated = True
 
     @staticmethod
     def _should_finish_execution(**kwargs) -> bool:
