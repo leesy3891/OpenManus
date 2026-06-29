@@ -95,8 +95,8 @@ temperature = 0.0                          # Controls randomness for vision mode
 
 
 ## Sandbox configuration
-#[sandbox]
-#use_sandbox = false
+[sandbox]
+use_sandbox = false
 #image = "python:3.12-slim"
 #work_dir = "/workspace"
 #memory_limit = "1g"  # 512m
