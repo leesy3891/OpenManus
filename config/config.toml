@@ -34,11 +34,11 @@ profile_dir = "record"
 # Any OpenAI-compatible vision endpoint works (OpenAI, Azure, Ollama-vision, etc.).
 [llm.vision]
 api_type = "openai"
-model = "gpt-4o"
+model = "gpt-5.4-mini"
 base_url = "https://api.openai.com/v1"
 api_key = "sk-..."
-max_tokens = 4096
-temperature = 0.0
+max_tokens = 8192
+temperature = 0.6
 
 # Alternative: Ollama local vision model
 # [llm.vision]
