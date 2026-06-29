@@ -1,10 +1,11 @@
 # Global LLM configuration
 [llm]
-model = "claude-3-7-sonnet-20250219"       # The LLM model to use
-base_url = "https://api.anthropic.com/v1/" # API endpoint URL
-api_key = "YOUR_API_KEY"                   # Your API key
-max_tokens = 8192                          # Maximum number of tokens in the response
-temperature = 0.0                          # Controls randomness
+api_type = "openai"
+model = "gpt-5"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+max_tokens = 4096
+temperature = 0.6                       # Controls randomness
 
 # [llm] # Amazon Bedrock
 # api_type = "aws"                                       # Required
