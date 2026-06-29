@@ -59,6 +59,7 @@ class Message(BaseModel):
     tool_calls: Optional[List[ToolCall]] = Field(default=None)
     name: Optional[str] = Field(default=None)
     tool_call_id: Optional[str] = Field(default=None)
+    base64_image: Optional[str] = Field(default=None)
 
     def __add__(self, other) -> List["Message"]:
         """支持 Message + list 或 Message + Message 的操作"""
@@ -94,9 +95,9 @@ class Message(BaseModel):
         return message
 
     @classmethod
-    def user_message(cls, content: str) -> "Message":
+    def user_message(cls, content: str, base64_image: Optional[str] = None) -> "Message":
         """Create a user message"""
-        return cls(role=Role.USER, content=content)
+        return cls(role=Role.USER, content=content, base64_image=base64_image)
 
     @classmethod
     def system_message(cls, content: str) -> "Message":

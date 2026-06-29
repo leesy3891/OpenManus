@@ -378,21 +378,34 @@ class LLM:
             logger.warning(f"[profiling] failed to record LLM call: {e}")
 
     @staticmethod
-    def format_messages(messages: List[Union[dict, Message]]) -> List[dict]:
+    def format_messages(
+        messages: List[Union[dict, Message]], supports_images: bool = False
+    ) -> List[dict]:
         """
         Format messages for LLM by converting them to OpenAI message format.
+
+        When supports_images=True, any Message with a base64_image field is converted
+        to the OpenAI multimodal content-list form. When False (default), behavior is
+        identical to before — image bytes never reach text-only models.
         """
         formatted_messages = []
 
         for message in messages:
             if isinstance(message, dict):
-                # If message is already a dict, ensure it has required fields
                 if "role" not in message:
                     raise ValueError("Message dict must contain 'role' field")
                 formatted_messages.append(message)
             elif isinstance(message, Message):
-                # If message is a Message object, convert it to dict
-                formatted_messages.append(message.to_dict())
+                msg_dict = message.to_dict()
+                if supports_images and message.base64_image:
+                    msg_dict["content"] = [
+                        {"type": "text", "text": message.content or ""},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": message.base64_image},
+                        },
+                    ]
+                formatted_messages.append(msg_dict)
             else:
                 raise TypeError(f"Unsupported message type: {type(message)}")
 
@@ -589,4 +602,72 @@ class LLM:
             raise
         except Exception as e:
             logger.error(f"Unexpected error in ask_tool: {e}")
+            raise
+
+    @retry(
+        wait=wait_random_exponential(min=1, max=60),
+        stop=stop_after_attempt(6),
+    )
+    async def ask_with_images(
+        self,
+        messages: List[Union[dict, Message]],
+        images: List[str],
+        system_msgs: Optional[List[Union[dict, Message]]] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Send messages with inline images to the vision LLM; return text only.
+
+        images[i] is attached to messages[i] as a base64 data-URL
+        (e.g. "data:image/png;base64,..."). Extra images beyond the number of
+        messages are ignored.
+        """
+        try:
+            image_messages: List[Union[dict, Message]] = []
+            for i, msg in enumerate(messages):
+                if isinstance(msg, Message) and i < len(images):
+                    msg = msg.model_copy(update={"base64_image": images[i]})
+                image_messages.append(msg)
+
+            if system_msgs:
+                formatted = self.format_messages(system_msgs) + self.format_messages(
+                    image_messages, supports_images=True
+                )
+            else:
+                formatted = self.format_messages(image_messages, supports_images=True)
+
+            params: dict = {
+                "model": self.model,
+                "messages": formatted,
+                "stream": False,
+            }
+
+            if _needs_max_completion_tokens(
+                self.api_type, self.model, self.use_max_completion_tokens
+            ):
+                params["max_completion_tokens"] = self.max_tokens
+            else:
+                params["max_tokens"] = self.max_tokens
+                params["temperature"] = (
+                    temperature if temperature is not None else self.temperature
+                )
+
+            start = time.time()
+            response = await self.client.chat.completions.create(**params)
+            latency = time.time() - start
+
+            if not response.choices or not response.choices[0].message.content:
+                raise ValueError("Empty or invalid response from vision LLM")
+
+            message = response.choices[0].message
+            self._record_call(response, message, latency)
+            return message.content
+
+        except ValueError as ve:
+            logger.error(f"Validation error in ask_with_images: {ve}")
+            raise
+        except OpenAIError as oe:
+            logger.error(f"OpenAI API error in ask_with_images: {oe}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in ask_with_images: {e}")
             raise

@@ -14,7 +14,7 @@ from app.agent.toolcall import ToolCallAgent
 from app.llm import LLM
 from app.prompt.manus import NEXT_STEP_PROMPT as _MANUS_NEXT_STEP_PROMPT
 from app.prompt.manus import SYSTEM_PROMPT
-from app.tool import Terminate, ToolCollection
+from app.tool import ImageQuery, Terminate, ToolCollection
 from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.file_creator_viewer import FileCreatorViewer
 from app.tool.file_saver import FileSaver
@@ -37,6 +37,10 @@ IMPORTANT — how to finish:
   use status="success" when the task is solved, status="failure" otherwise.
 - Do not keep repeating a tool call that is not making progress. If you are stuck,
   call `terminate` with status="failure" instead of looping.
+
+If the task references an image file path, FIRST call `image_query` with that path \
+and a specific question, then reason over the returned text. Do not attempt to read \
+images any other way.
 """
 
 
@@ -69,6 +73,7 @@ class ProfiledExecutorAgent(ToolCallAgent):
             FileSaver(),
             BrowserUseTool(),
             FileCreatorViewer(),
+            ImageQuery(),
             Terminate(),
         )
     )

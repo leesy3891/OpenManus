@@ -29,16 +29,20 @@ enable_thinking = true
 profile_cache = true
 profile_dir = "record"
 
-# Optional configuration for specific LLM models
-#[llm.vision]
-#model = "claude-3-7-sonnet"    # The vision model to use
-#base_url = "https://api.openai.com/v1"    # API endpoint URL for vision model
-#api_key = "sk-..."    # Your API key for vision model
-#max_tokens = 8192     # Maximum number of tokens in the response
-#temperature = 0.0     # Controls randomness for vision model
+# Vision model — used by ImageQuery tool for image-to-text conversion.
+# Replace api_key / model with your actual credentials.
+# Any OpenAI-compatible vision endpoint works (OpenAI, Azure, Ollama-vision, etc.).
+[llm.vision]
+api_type = "openai"
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+max_tokens = 4096
+temperature = 0.0
 
-# [llm.vision] #OLLAMA VISION:
-# api_type = 'ollama'
+# Alternative: Ollama local vision model
+# [llm.vision]
+# api_type = "openai"
 # model = "llama3.2-vision"
 # base_url = "http://localhost:11434/v1"
 # api_key = "ollama"
