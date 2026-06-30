@@ -8,14 +8,14 @@
 api_type = "openai"
 model = "gpt-5"
 base_url = "https://api.openai.com/v1"
-api_key = "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"
+api_key = "sk-..."
 max_tokens = 4096
 temperature = 0.6
 
 # Local HuggingFace profiled sub-LLM (used by ProfiledExecutorAgent via config_name="profiled_qwen")
 [llm.profiled_qwen]
 api_type = "hf_local"
-model = "Qwen/Qwen3-14B"
+model = "Qwen/Qwen3-32B"
 base_url = ""
 api_key = ""
 max_tokens = 4096
@@ -23,7 +23,7 @@ temperature = 0.6
 device_map = "auto"
 torch_dtype = "bfloat16"
 load_in_4bit = false
-load_in_8bit = false
+load_in_8bit = true
 attn_implementation = "eager"
 enable_thinking = true
 profile_cache = true
@@ -36,9 +36,9 @@ profile_dir = "record"
 api_type = "openai"
 model = "gpt-4o"
 base_url = "https://api.openai.com/v1"
-api_key = "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"
+api_key = "sk-..."
 max_tokens = 4096
-temperature = 0.0
+temperature = 0.5
 
 # Alternative: Ollama local vision model
 # [llm.vision]
