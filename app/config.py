@@ -57,6 +57,10 @@ class LLMSettings(BaseModel):
     profile_cache: bool = Field(
         default=False, description="Collect KV/V-cache summaries for this LLM"
     )
+    profile_influence: bool = Field(
+        default=False,
+        description="Run Phase-B analysis re-forward for T2/T3/T5 head influence metrics",
+    )
     profile_dir: Optional[str] = Field(
         default="record", description="Output directory for profiling artifacts"
     )
@@ -117,6 +121,7 @@ _OPTIONAL_LLM_KEYS = (
     "attn_implementation",
     "enable_thinking",
     "profile_cache",
+    "profile_influence",
     "profile_dir",
     "use_max_completion_tokens",
 )

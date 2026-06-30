@@ -3,29 +3,44 @@ Local HuggingFace chat backend that mimics the OpenAI async client interface
 ( client.chat.completions.create(...) ) so it can be dropped into app/llm.py
 in place of AsyncOpenAI for `api_type == "hf_local"`.
 
-Design constraints (see understanding_OpenManus_code_structure):
-  * Compatible with LLM.ask and LLM.ask_tool return expectations:
-    response.choices[0].message has `.content` and `.tool_calls`.
-  * tool_calls are real app.schema.ToolCall objects (model_dump-able), never dummies.
+Design constraints:
+  * Compatible with LLM.ask and LLM.ask_tool return expectations.
+  * tool_calls are real app.schema.ToolCall objects.
   * Non-streaming only.
-  * Heavy deps (torch/transformers) are imported lazily inside __init__ so the
-    openai/azure/hf paths keep working in environments without them.
+  * Heavy deps (torch/transformers) are imported lazily inside __init__.
 
-KV / V-cache profiling:
-  * Generation runs with use_cache=True.
-  * When profile_cache is enabled, a single forward pass over (prompt + generated)
-    is used to read past_key_values and mean-pool each layer's value tensor to a
-    compact [num_kv_heads, head_dim] summary. We never keep full V tensors.
-  * "head" = KV head index (Qwen3 uses grouped-query attention).
+KV / V-cache and influence profiling — two phases per call:
+
+Phase A (generation)
+  - use_cache=True, torch.no_grad().
+  - T1: collect V-cache with mean-pool over decision window [p-W, p].
+
+Phase B (analysis re-forward) — only when profile_influence=True
+  - Teacher-forced forward over (prompt + generated) with use_cache=False,
+    attn_implementation="eager", and gradients enabled.
+  - o_proj pre-hooks capture head-concat activations at decision position p.
+  - One backward pass (loss = log_softmax(logits_p)[y*]).
+  - T2: head output contribution norm  ||c^h||  where c^h = z^h @ W_O_h.T
+  - T3: direct logit attribution  dla^h = (c^h ⊙ γ·s) · W_U[y*,:]
+         (linearised RMSNorm; direct path only — indirect effects not captured)
+  - T5: gradient-based sensitivity  ||∂loss/∂z^h||
+         (first-order / local approximation)
+  Phase B is wrapped in try/except; generation result survives any failure.
+  Additional GPU memory is required for the full forward graph during Phase B.
+
+GQA indexing:
+  - T1 is indexed by KV head (num_kv_heads).
+  - T2/T3/T5 are indexed by query head (num_attention_heads).
+  - kv_group = query_head // (num_attention_heads // num_key_value_heads).
 """
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import LLMSettings
 from app.logger import logger
-from app.models.tool_parser import parse_generated_output
+from app.models.tool_parser import find_decision_token_pos, parse_generated_output
 
 
 # --------------------------------------------------------------------------------------
@@ -40,7 +55,7 @@ class _Message:
 
 
 class _Choice:
-    def __init__(self, message: _Message):
+    def __init__(self, message: "_Message"):
         self.index = 0
         self.message = message
         self.finish_reason = "stop"
@@ -77,7 +92,6 @@ class _Chat:
 # --------------------------------------------------------------------------------------
 class LocalHFClient:
     def __init__(self, settings: LLMSettings):
-        # lazy heavy imports
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -86,6 +100,9 @@ class LocalHFClient:
         self.model_name = settings.model
         self.enable_thinking = bool(getattr(settings, "enable_thinking", False))
         self.profile_cache = bool(getattr(settings, "profile_cache", False))
+        self.profile_influence = bool(getattr(settings, "profile_influence", False))
+        # Window width W for T1 windowed V-cache pooling around decision position p.
+        self._v_cache_window_W: int = 5
 
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -94,10 +111,14 @@ class LocalHFClient:
             "float32": torch.float32,
             "auto": "auto",
         }
-        torch_dtype = dtype_map.get(getattr(settings, "torch_dtype", None) or "auto", "auto")
+        torch_dtype = dtype_map.get(
+            getattr(settings, "torch_dtype", None) or "auto", "auto"
+        )
 
         quant_config = None
-        if getattr(settings, "load_in_4bit", False) or getattr(settings, "load_in_8bit", False):
+        if getattr(settings, "load_in_4bit", False) or getattr(
+            settings, "load_in_8bit", False
+        ):
             try:
                 from transformers import BitsAndBytesConfig
 
@@ -116,20 +137,23 @@ class LocalHFClient:
             self.model_name, trust_remote_code=True
         )
 
+        attn_impl = getattr(settings, "attn_implementation", None) or "eager"
         model_kwargs: Dict[str, Any] = {
             "device_map": getattr(settings, "device_map", None) or "auto",
             "trust_remote_code": True,
-            "attn_implementation": getattr(settings, "attn_implementation", None) or "eager",
+            "attn_implementation": attn_impl,
         }
         if quant_config is not None:
             model_kwargs["quantization_config"] = quant_config
         else:
             model_kwargs["torch_dtype"] = torch_dtype
 
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name, **model_kwargs
+        )
         self.model.eval()
+        self._attn_impl = attn_impl
 
-        # OpenAI-compatible surface
         self.chat = _Chat(self)
         logger.info("[hf_local] model ready")
 
@@ -146,7 +170,6 @@ class LocalHFClient:
         stream: bool = False,
         **kwargs,
     ) -> _Response:
-        # generation is blocking -> run in a thread so we don't stall the event loop
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
@@ -177,7 +200,8 @@ class LocalHFClient:
             for pname, pdef in params.items():
                 req = " (required)" if pname in required else ""
                 lines.append(
-                    f"    * {pname} ({pdef.get('type', 'any')}){req}: {pdef.get('description', '')}"
+                    f"    * {pname} ({pdef.get('type', 'any')}){req}: "
+                    f"{pdef.get('description', '')}"
                 )
         return "\n".join(lines)
 
@@ -185,7 +209,6 @@ class LocalHFClient:
         msgs = list(messages)
         if tools:
             tool_msg = {"role": "system", "content": self._render_tools(tools)}
-            # keep any existing system message first, then the tool spec
             if msgs and msgs[0].get("role") == "system":
                 msgs = [msgs[0], tool_msg] + msgs[1:]
             else:
@@ -199,12 +222,11 @@ class LocalHFClient:
                 enable_thinking=self.enable_thinking,
             )
         except TypeError:
-            # older templates without enable_thinking kwarg
             return self.tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True
             )
 
-    # ---- sync generation + profiling ----------------------------------------------
+    # ---- main sync entry point (Phase A + Phase B) ---------------------------------
     def _generate_sync(
         self,
         messages: List[dict],
@@ -220,7 +242,6 @@ class LocalHFClient:
 
         enc = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
         input_len = int(enc.input_ids.shape[1])
-        # raw input token ids (for input-overlap analysis in tool_compare)
         input_token_ids = enc.input_ids[0].tolist()
 
         gen_kwargs = dict(
@@ -234,34 +255,74 @@ class LocalHFClient:
         else:
             gen_kwargs.update(do_sample=False)
 
+        # ---- Phase A: generation ---------------------------------------------------
         with torch.no_grad():
             out = self.model.generate(**enc, **gen_kwargs)
 
-        full_ids = out.sequences[0]
+        full_ids = out.sequences[0]                    # [seq_len]
         gen_ids = full_ids[input_len:]
         output_tokens_including_think = int(gen_ids.shape[0])
         gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
         think_text, content, tool_calls = parse_generated_output(gen_text)
 
-        # output tokens excluding <think>
         think_len = 0
         if think_text:
             try:
-                think_len = len(self.tokenizer(think_text, add_special_tokens=False).input_ids)
+                think_len = len(
+                    self.tokenizer(think_text, add_special_tokens=False).input_ids
+                )
             except Exception:
                 think_len = 0
         output_tokens = max(0, output_tokens_including_think - think_len)
 
         selected_tool = tool_calls[0].function.name if tool_calls else None
 
-        # V-cache summary (optional, expensive)
+        # Find decision token position p and y* (first token of selected tool name)
+        decision_pos: Optional[int] = None
+        decision_token_id: Optional[int] = None
+        decision_token_str: str = ""
+        if selected_tool:
+            try:
+                full_ids_list = full_ids.tolist()
+                decision_pos, decision_token_id = find_decision_token_pos(
+                    self.tokenizer,
+                    full_ids_list,
+                    input_len,
+                    gen_text,
+                    selected_tool,
+                )
+                if decision_token_id is not None:
+                    decision_token_str = self.tokenizer.decode(
+                        [decision_token_id], skip_special_tokens=False
+                    )
+            except Exception as e:
+                logger.warning(f"[hf_local] decision token search failed: {e}")
+
+        # T1: windowed V-cache around decision position
         v_cache_summary = None
         if self.profile_cache:
             try:
-                v_cache_summary = self._collect_v_cache(full_ids.unsqueeze(0))
+                v_cache_summary = self._collect_v_cache_windowed(
+                    full_ids.unsqueeze(0), decision_pos, self._v_cache_window_W
+                )
             except Exception as e:
                 logger.warning(f"[hf_local] V-cache profiling failed: {e}")
+
+        # ---- Phase B: analysis re-forward for T2/T3/T5 ----------------------------
+        head_metrics: List[Dict[str, Any]] = []
+        hf_model_meta: Optional[Dict[str, Any]] = None
+        if self.profile_influence and decision_pos is not None and decision_token_id is not None:
+            hf_model_meta = self._build_model_meta()
+            try:
+                head_metrics = self._run_analysis_forward(
+                    full_ids.unsqueeze(0), decision_pos, decision_token_id
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[hf_local] Phase B analysis failed (generation result preserved): {e}",
+                    exc_info=True,
+                )
 
         message = _Message(content=content or None, tool_calls=tool_calls)
         message._profiling = {
@@ -273,38 +334,289 @@ class LocalHFClient:
             "v_cache_summary": v_cache_summary,
             "selected_tool": selected_tool,
             "input_token_ids": input_token_ids,
+            # new fields
+            "decision_token_pos": decision_pos,
+            "decision_token_id": decision_token_id,
+            "decision_token_str": decision_token_str,
+            "head_metrics": head_metrics,
+            "hf_model_meta": hf_model_meta,
         }
-        usage = _Usage(prompt_tokens=input_len, completion_tokens=output_tokens_including_think)
+        usage = _Usage(
+            prompt_tokens=input_len,
+            completion_tokens=output_tokens_including_think,
+        )
         return _Response([_Choice(message)], usage=usage)
 
+    # ---- T1: windowed V-cache -----------------------------------------------------
     def _layer_values(self, past_key_values):
-        """Return a list of value tensors (one per layer), handling both legacy tuples
-        and the newer Cache objects."""
+        """Return list of value tensors (one per layer) from legacy tuples or Cache obj."""
         if past_key_values is None:
             return []
         if hasattr(past_key_values, "to_legacy_cache"):
             legacy = past_key_values.to_legacy_cache()
             return [kv[1] for kv in legacy]
-        # legacy tuple of (key, value) per layer
         return [kv[1] for kv in past_key_values]
 
-    def _collect_v_cache(self, full_ids) -> Dict[tuple, List[float]]:
+    def _collect_v_cache_windowed(
+        self,
+        full_ids,           # [1, seq_len]
+        decision_pos: Optional[int],
+        window_W: int = 5,
+    ) -> Dict[Tuple[int, int], List[float]]:
+        """Mean-pool V-cache over window [p-W, p] around decision position p.
+
+        Falls back to full-sequence pooling if decision_pos is None (backward compat).
+        T1 is indexed by KV head (not query head).
+        """
         torch = self._torch
+        seq_len = full_ids.shape[1]
+
         with torch.no_grad():
             out = self.model(input_ids=full_ids, use_cache=True, return_dict=True)
 
-        summary: Dict[tuple, List[float]] = {}
+        # Determine pool window
+        if decision_pos is not None:
+            win_start = max(0, decision_pos - window_W)
+            win_end = min(decision_pos + 1, seq_len)  # p inclusive
+        else:
+            win_start = 0
+            win_end = seq_len
+
+        summary: Dict[Tuple[int, int], List[float]] = {}
         values = self._layer_values(getattr(out, "past_key_values", None))
         for layer_idx, value in enumerate(values):
             # value: [batch, num_kv_heads, seq, head_dim]
-            v = value[0]                  # [num_kv_heads, seq, head_dim]
-            pooled = v.mean(dim=1)        # mean-pool over sequence -> [num_kv_heads, head_dim]
+            v = value[0]                                         # [kv_heads, seq, head_dim]
+            v_win = v[:, win_start:win_end, :]                  # [kv_heads, win, head_dim]
+            if v_win.shape[1] == 0:
+                continue
+            pooled = v_win.mean(dim=1)                          # [kv_heads, head_dim]
             pooled = pooled.to(torch.float32).cpu().numpy()
             for head_idx in range(pooled.shape[0]):
                 summary[(layer_idx, head_idx)] = pooled[head_idx].tolist()
 
-        # free memory
         del out
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return summary
+
+    # ---- Phase B: T2 / T3 / T5 analysis re-forward --------------------------------
+    def _build_model_meta(self) -> Dict[str, Any]:
+        """Collect model config info for meta.json."""
+        cfg = self.model.config
+        num_q = getattr(cfg, "num_attention_heads", None)
+        num_kv = getattr(cfg, "num_key_value_heads", None)
+        h_dim = getattr(cfg, "head_dim", None)
+        if h_dim is None and num_q:
+            h_dim = getattr(cfg, "hidden_size", 0) // num_q
+        return {
+            "model_name": self.model_name,
+            "num_attention_heads": num_q,
+            "num_key_value_heads": num_kv,
+            "head_dim": h_dim,
+            "num_hidden_layers": getattr(cfg, "num_hidden_layers", None),
+            "hidden_size": getattr(cfg, "hidden_size", None),
+            "attn_implementation": self._attn_impl,
+            "v_cache_window_W": self._v_cache_window_W,
+            "profile_influence": self.profile_influence,
+            "t1_head_type": "kv",
+            "t2_t3_t5_head_type": "query",
+            "dla_note": (
+                "Direct path only (linearised RMSNorm). "
+                "Indirect effects not captured; later layers dominate."
+            ),
+            "t5_note": "First-order / local approximation via one backward pass.",
+        }
+
+    def _run_analysis_forward(
+        self,
+        full_ids,           # [1, seq_len]
+        p: int,             # prediction position (logits at p predict full_ids[p+1])
+        y_star: int,        # decision token id
+    ) -> List[Dict[str, Any]]:
+        """Phase B: one teacher-forced forward + one backward for T2/T3/T5.
+
+        Additional GPU memory is needed to hold the full autograd graph.
+        Any exception is caught by the caller; generation result is unaffected.
+        """
+        torch = self._torch
+
+        # ---- validate attn_implementation ----------------------------------------
+        actual_impl = getattr(self.model.config, "_attn_implementation", self._attn_impl)
+        if actual_impl not in ("eager", None):
+            logger.warning(
+                f"[hf_local] T2/T3/T5 require eager attention; "
+                f"detected '{actual_impl}'. Skipping influence analysis."
+            )
+            return []
+
+        # ---- extract model architecture ------------------------------------------
+        try:
+            layers = self.model.model.layers
+            final_norm = self.model.model.norm
+            lm_head = self.model.lm_head
+        except AttributeError as e:
+            logger.warning(f"[hf_local] unexpected model structure for T2/T3/T5: {e}")
+            return []
+
+        cfg = self.model.config
+        num_q_heads = cfg.num_attention_heads
+        num_kv_heads = getattr(cfg, "num_key_value_heads", num_q_heads)
+        head_dim = getattr(cfg, "head_dim", None) or (
+            cfg.hidden_size // num_q_heads
+        )
+        num_layers = cfg.num_hidden_layers
+        gqa_ratio = max(1, num_q_heads // num_kv_heads)
+
+        seq_len = full_ids.shape[1]
+        if not (0 < p < seq_len - 1):
+            logger.warning(
+                f"[hf_local] decision_pos={p} out of range for seq_len={seq_len}"
+            )
+            return []
+
+        if not (0 <= y_star < lm_head.weight.shape[0]):
+            logger.warning(f"[hf_local] y_star={y_star} out of vocab range")
+            return []
+
+        # ---- install hooks --------------------------------------------------------
+        # head_concat_at_p[layer_idx]: tensor [num_q_heads * head_dim] at pos p
+        # with retain_grad() so we can read .grad after backward.
+        head_concat_at_p: Dict[int, Any] = {}
+        resid_pre_norm: Dict[str, Any] = {}
+        hooks = []
+
+        for i in range(num_layers):
+            try:
+                o_proj = layers[i].self_attn.o_proj
+            except AttributeError:
+                continue
+
+            def _make_oprojhook(layer_idx: int):
+                def _hook(module, args):
+                    # args[0]: [batch, seq, num_q_heads * head_dim]
+                    x = args[0]
+                    if x.shape[1] <= p:
+                        return
+                    h = x[0, p, :]   # [num_q_heads * head_dim]
+                    head_concat_at_p[layer_idx] = h
+                    if h.requires_grad:
+                        h.retain_grad()
+                return _hook
+
+            hooks.append(o_proj.register_forward_pre_hook(_make_oprojhook(i)))
+
+        def _norm_pre_hook(module, args):
+            x = args[0]  # [batch, seq, hidden]
+            if x.shape[1] > p:
+                resid_pre_norm["r"] = x[0, p, :].detach().clone().float()
+
+        hooks.append(final_norm.register_forward_pre_hook(_norm_pre_hook))
+
+        # ---- forward + backward ---------------------------------------------------
+        try:
+            with torch.enable_grad():
+                out = self.model(
+                    input_ids=full_ids,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                logits_p = out.logits[0, p, :]  # [vocab]
+                loss = torch.nn.functional.log_softmax(logits_p, dim=0)[y_star]
+                loss.backward()
+        finally:
+            for h in hooks:
+                h.remove()
+            hooks.clear()
+
+        # ---- compute T2 / T3 / T5 ------------------------------------------------
+        lm_head_w = lm_head.weight.detach().float()   # [vocab, hidden]
+        gamma = final_norm.weight.detach().float()     # [hidden]
+
+        # RMSNorm linearisation scale at position p
+        r = resid_pre_norm.get("r")
+        norm_scale: Optional[float] = None
+        if r is not None:
+            eps = getattr(final_norm, "variance_epsilon", None) or getattr(
+                final_norm, "eps", 1e-6
+            )
+            rms = float((r.pow(2).mean() + eps).sqrt())
+            norm_scale = 1.0 / rms if rms > 0 else None
+
+        w_u_y = lm_head_w[y_star, :]  # [hidden] — unembedding direction for y*
+
+        rows: List[Dict[str, Any]] = []
+
+        for layer_idx in range(num_layers):
+            h_tensor = head_concat_at_p.get(layer_idx)
+            if h_tensor is None:
+                continue
+
+            try:
+                o_proj_w = (
+                    layers[layer_idx].self_attn.o_proj.weight.detach().float()
+                )  # [hidden_out, num_q_heads * head_dim]
+            except AttributeError:
+                continue
+
+            h_float = h_tensor.detach().float()    # [num_q_heads * head_dim]
+            grad_h = h_tensor.grad                 # [num_q_heads * head_dim] or None
+
+            for q_h in range(num_q_heads):
+                kv_group = q_h // gqa_ratio
+                s = q_h * head_dim
+                e = s + head_dim
+
+                z_h = h_float[s:e]                              # [head_dim]
+                W_O_h = o_proj_w[:, s:e]                       # [hidden_out, head_dim]
+                c_h = z_h @ W_O_h.t()                          # [hidden_out]
+
+                # T2 — head output contribution norm
+                contrib_norm = float(c_h.norm())
+                rows.append(
+                    {
+                        "layer": layer_idx,
+                        "head": q_h,
+                        "head_type": "query",
+                        "kv_group": kv_group,
+                        "metric_type": "contrib_norm",
+                        "value": contrib_norm,
+                    }
+                )
+
+                # T3 — direct logit attribution (linearised RMSNorm; direct path only)
+                if norm_scale is not None:
+                    c_h_norm = c_h * gamma * norm_scale         # [hidden]
+                    dla = float((c_h_norm * w_u_y).sum())
+                    rows.append(
+                        {
+                            "layer": layer_idx,
+                            "head": q_h,
+                            "head_type": "query",
+                            "kv_group": kv_group,
+                            "metric_type": "dla",
+                            "value": dla,
+                        }
+                    )
+
+                # T5 — gradient sensitivity (first-order approximation)
+                if grad_h is not None:
+                    g_h = grad_h[s:e].float()                   # [head_dim]
+                    grad_sens = float(g_h.norm())
+                    rows.append(
+                        {
+                            "layer": layer_idx,
+                            "head": q_h,
+                            "head_type": "query",
+                            "kv_group": kv_group,
+                            "metric_type": "grad_sens",
+                            "value": grad_sens,
+                        }
+                    )
+
+        # free graph memory
+        del out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return rows

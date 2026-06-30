@@ -325,6 +325,18 @@ class LLM:
     def _llm_type(self) -> str:
         return "sub" if self.api_type == "hf_local" else "main"
 
+    @staticmethod
+    def _make_tool_schema_summary(tools: Optional[List[dict]]) -> str:
+        """Short one-line summary of available tool names for the input log."""
+        if not tools:
+            return ""
+        names = [
+            t.get("function", {}).get("name", "?")
+            for t in tools
+            if isinstance(t, dict)
+        ]
+        return "tools=[" + ", ".join(names) + "]"
+
     def _record_call(self, response, message, latency: float) -> None:
         """Write latency / token metrics to the active ProfilingRecorder, if any."""
         recorder = get_active_recorder()
@@ -575,6 +587,23 @@ class LLM:
                 params["temperature"] = (
                     temperature if temperature is not None else self.temperature
                 )
+
+            # Pre-record sub-LLM input (messages + tool schema) before the call.
+            # Uses peek_next_call_index() so the index matches the upcoming record_sub_llm.
+            if self.api_type == "hf_local":
+                _pre_recorder = get_active_recorder()
+                if _pre_recorder is not None:
+                    try:
+                        _pre_call_idx = _pre_recorder.peek_next_call_index()
+                        _pre_recorder.record_sub_llm_input(
+                            call_index=_pre_call_idx,
+                            messages=list(messages),
+                            tool_schema_summary=self._make_tool_schema_summary(tools),
+                        )
+                    except Exception as _pre_err:
+                        logger.warning(
+                            f"[profiling] failed to pre-record sub-LLM input: {_pre_err}"
+                        )
 
             start = time.time()
             response = await self.client.chat.completions.create(**params)
