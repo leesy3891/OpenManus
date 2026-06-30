@@ -137,9 +137,27 @@ class LocalHFClient:
             self.model_name, trust_remote_code=True
         )
 
-        attn_impl = getattr(settings, "attn_implementation", None) or "eager"
+        # Attention backend. We default to (and prefer) SDPA: eager materialises a
+        # full [seq, seq] attention matrix per layer, which — combined with the
+        # grad-enabled, full-graph Phase B forward — is the dominant OOM source.
+        # The influence profiling reads ONLY the o_proj input (head-concat), never the
+        # attention probabilities, so SDPA is sufficient and far cheaper. If a config
+        # still asks for eager while influence profiling is on, override it.
+        attn_impl = getattr(settings, "attn_implementation", None) or "sdpa"
+        if self.profile_influence and attn_impl == "eager":
+            logger.warning(
+                "[hf_local] influence profiling does not need attention matrices; "
+                "overriding attn_implementation 'eager' -> 'sdpa' to avoid OOM."
+            )
+            attn_impl = "sdpa"
+
+        # Single 48GB GPU: pin everything to cuda:0 so accelerate never silently
+        # offloads layers to CPU (which would make the Phase B backward crawl/break).
+        _dev = getattr(settings, "device_map", None)
+        device_map = {"": 0} if _dev in (None, "auto") else _dev
+
         model_kwargs: Dict[str, Any] = {
-            "device_map": getattr(settings, "device_map", None) or "auto",
+            "device_map": device_map,
             "trust_remote_code": True,
             "attn_implementation": attn_impl,
         }
@@ -441,14 +459,8 @@ class LocalHFClient:
         """
         torch = self._torch
 
-        # ---- validate attn_implementation ----------------------------------------
-        actual_impl = getattr(self.model.config, "_attn_implementation", self._attn_impl)
-        if actual_impl not in ("eager", None):
-            logger.warning(
-                f"[hf_local] T2/T3/T5 require eager attention; "
-                f"detected '{actual_impl}'. Skipping influence analysis."
-            )
-            return []
+        # SDPA is fine here: we capture the o_proj input (head-concat) via hooks and
+        # never read attention probabilities, so there is no eager requirement.
 
         # ---- extract model architecture ------------------------------------------
         try:
@@ -468,10 +480,10 @@ class LocalHFClient:
         num_layers = cfg.num_hidden_layers
         gqa_ratio = max(1, num_q_heads // num_kv_heads)
 
-        seq_len = full_ids.shape[1]
-        if not (0 < p < seq_len - 1):
+        orig_seq_len = full_ids.shape[1]
+        if not (0 < p < orig_seq_len):
             logger.warning(
-                f"[hf_local] decision_pos={p} out of range for seq_len={seq_len}"
+                f"[hf_local] decision_pos={p} out of range for seq_len={orig_seq_len}"
             )
             return []
 
@@ -479,59 +491,123 @@ class LocalHFClient:
             logger.warning(f"[hf_local] y_star={y_star} out of vocab range")
             return []
 
-        # ---- install hooks --------------------------------------------------------
-        # head_concat_at_p[layer_idx]: tensor [num_q_heads * head_dim] at pos p
-        # with retain_grad() so we can read .grad after backward.
-        head_concat_at_p: Dict[int, Any] = {}
+        # Only logits at position p matter, so drop everything after p. This shrinks
+        # the Phase B sequence (and hence the autograd graph) to [0 .. p]; p becomes
+        # the last index of the truncated sequence.
+        analysis_ids = full_ids[:, : p + 1]
+        seq_len = analysis_ids.shape[1]  # == p + 1
+
+        # ---- memory-saving setup for the grad-enabled re-forward ------------------
+        # 1) Freeze ALL params: we only need gradients w.r.t. ACTIVATIONS (z^h), not
+        #    weights. This removes large param-grad buffers (e.g. lm_head ~1.5GB) and
+        #    avoids cross-call grad accumulation. enable_input_require_grads() then
+        #    re-introduces a grad source at the embeddings so the activation graph
+        #    (and our backward hooks) still receive gradients.
+        # 2) Gradient checkpointing (non-reentrant): recompute layer activations in
+        #    backward instead of retaining all layers' activations -> the single
+        #    biggest Phase B memory saver. Requires use_cache=False.
+        prev_use_cache = getattr(self.model.config, "use_cache", None)
+        ckpt_enabled = False
+        input_req_grads = False
+
+        # z_at_p[layer]:  detached head-concat VALUES at p          -> T2 / T3
+        # gz_at_p[layer]: grad of loss w.r.t. that head-concat at p -> T5
+        # Two hooks (forward values + module backward grad) so capture survives
+        # gradient checkpointing, where retain_grad() on a recomputed intermediate
+        # would NOT be populated.
+        z_at_p: Dict[int, Any] = {}
+        gz_at_p: Dict[int, Any] = {}
         resid_pre_norm: Dict[str, Any] = {}
-        hooks = []
 
-        for i in range(num_layers):
-            try:
-                o_proj = layers[i].self_attn.o_proj
-            except AttributeError:
-                continue
-
-            def _make_oprojhook(layer_idx: int):
-                def _hook(module, args):
-                    # args[0]: [batch, seq, num_q_heads * head_dim]
-                    x = args[0]
-                    if x.shape[1] <= p:
-                        return
-                    h = x[0, p, :]   # [num_q_heads * head_dim]
-                    head_concat_at_p[layer_idx] = h
-                    if h.requires_grad:
-                        h.retain_grad()
-                return _hook
-
-            hooks.append(o_proj.register_forward_pre_hook(_make_oprojhook(i)))
-
-        def _norm_pre_hook(module, args):
-            x = args[0]  # [batch, seq, hidden]
-            if x.shape[1] > p:
-                resid_pre_norm["r"] = x[0, p, :].detach().clone().float()
-
-        hooks.append(final_norm.register_forward_pre_hook(_norm_pre_hook))
-
-        # ---- forward + backward ---------------------------------------------------
         try:
-            with torch.enable_grad():
-                out = self.model(
-                    input_ids=full_ids,
-                    use_cache=False,
-                    return_dict=True,
+            self.model.requires_grad_(False)
+            self.model.enable_input_require_grads()
+            input_req_grads = True
+            self.model.config.use_cache = False
+            try:
+                self.model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
                 )
-                logits_p = out.logits[0, p, :]  # [vocab]
-                loss = torch.nn.functional.log_softmax(logits_p, dim=0)[y_star]
-                loss.backward()
+            except TypeError:
+                self.model.gradient_checkpointing_enable()
+            ckpt_enabled = True
+
+            # ---- install hooks ----------------------------------------------------
+            hooks = []
+            for i in range(num_layers):
+                try:
+                    o_proj = layers[i].self_attn.o_proj
+                except AttributeError:
+                    continue
+
+                def _make_fwd(layer_idx: int):
+                    def _hook(module, args):
+                        x = args[0]  # [batch, seq, num_q_heads * head_dim]
+                        if x.shape[1] > p:
+                            z_at_p[layer_idx] = x[0, p, :].detach().to(torch.float32)
+                    return _hook
+
+                def _make_bwd(layer_idx: int):
+                    def _hook(module, grad_input, grad_output):
+                        gi = grad_input[0] if grad_input else None
+                        if gi is not None and gi.shape[1] > p:
+                            gz_at_p[layer_idx] = gi[0, p, :].detach().to(torch.float32)
+                    return _hook
+
+                hooks.append(o_proj.register_forward_pre_hook(_make_fwd(i)))
+                hooks.append(o_proj.register_full_backward_hook(_make_bwd(i)))
+
+            def _norm_pre_hook(module, args):
+                x = args[0]  # [batch, seq, hidden]
+                if x.shape[1] > p:
+                    resid_pre_norm["r"] = x[0, p, :].detach().clone().float()
+
+            hooks.append(final_norm.register_forward_pre_hook(_norm_pre_hook))
+
+            # ---- forward (+ isolated backward) -----------------------------------
+            try:
+                with torch.enable_grad():
+                    out = self.model(
+                        input_ids=analysis_ids,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    logits_p = out.logits[0, p, :]  # [vocab]
+                    loss = torch.nn.functional.log_softmax(logits_p, dim=0)[y_star]
+                    # Backward is isolated: T2/T3 only need the forward values
+                    # (z_at_p / residual), so a backward OOM/failure must not discard
+                    # them — it only drops T5.
+                    try:
+                        loss.backward()
+                    except Exception as e:
+                        logger.warning(
+                            f"[hf_local] Phase B backward failed; keeping T2/T3, "
+                            f"skipping T5: {e}"
+                        )
+            finally:
+                for h in hooks:
+                    h.remove()
+                hooks.clear()
         finally:
-            for h in hooks:
-                h.remove()
-            hooks.clear()
+            # Restore the model to its normal inference configuration.
+            if ckpt_enabled:
+                try:
+                    self.model.gradient_checkpointing_disable()
+                except Exception:
+                    pass
+            if input_req_grads:
+                try:
+                    self.model.disable_input_require_grads()
+                except Exception:
+                    pass
+            if prev_use_cache is not None:
+                self.model.config.use_cache = prev_use_cache
 
         # ---- compute T2 / T3 / T5 ------------------------------------------------
-        lm_head_w = lm_head.weight.detach().float()   # [vocab, hidden]
-        gamma = final_norm.weight.detach().float()     # [hidden]
+        # Index the single unembedding row BEFORE up-casting; casting the whole
+        # [vocab, hidden] lm_head to float32 would waste ~3GB for one row.
+        gamma = final_norm.weight.detach().float()              # [hidden]
+        w_u_y = lm_head.weight[y_star, :].detach().float()      # [hidden]
 
         # RMSNorm linearisation scale at position p
         r = resid_pre_norm.get("r")
@@ -543,13 +619,11 @@ class LocalHFClient:
             rms = float((r.pow(2).mean() + eps).sqrt())
             norm_scale = 1.0 / rms if rms > 0 else None
 
-        w_u_y = lm_head_w[y_star, :]  # [hidden] — unembedding direction for y*
-
         rows: List[Dict[str, Any]] = []
 
         for layer_idx in range(num_layers):
-            h_tensor = head_concat_at_p.get(layer_idx)
-            if h_tensor is None:
+            h_float = z_at_p.get(layer_idx)          # [num_q_heads * head_dim] or None
+            if h_float is None:
                 continue
 
             try:
@@ -559,8 +633,7 @@ class LocalHFClient:
             except AttributeError:
                 continue
 
-            h_float = h_tensor.detach().float()    # [num_q_heads * head_dim]
-            grad_h = h_tensor.grad                 # [num_q_heads * head_dim] or None
+            grad_h = gz_at_p.get(layer_idx)          # [num_q_heads * head_dim] or None
 
             for q_h in range(num_q_heads):
                 kv_group = q_h // gqa_ratio
