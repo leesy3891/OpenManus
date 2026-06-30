@@ -1,0 +1,4 @@
+run_id,step_index,call_index,agent_name,llm_type,model,selected_tool,input_tokens,output_tokens,output_tokens_including_think,llm_latency_sec,tool_latency_sec,finish_reason
+20260630_212350_350401,,,default,main,gpt-5,,433,1123,1123,25.463368,,tool_calls
+20260630_212350_350401,0,0,profiled_qwen,sub,Qwen/Qwen3-32B,python_execute,1952,84,802,182.027894,0.207393,
+20260630_212350_350401,0,1,profiled_qwen,sub,Qwen/Qwen3-32B,terminate,2661,50,213,58.447998,0.000040,
