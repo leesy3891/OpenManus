@@ -15,7 +15,7 @@ temperature = 0.6
 # Local HuggingFace profiled sub-LLM (used by ProfiledExecutorAgent via config_name="profiled_qwen")
 [llm.profiled_qwen]
 api_type = "hf_local"
-model = "Qwen/Qwen3-14B"
+model = "Qwen/Qwen3-32B"
 base_url = ""
 api_key = ""
 max_tokens = 4096
@@ -23,7 +23,7 @@ temperature = 0.6
 device_map = "auto"
 torch_dtype = "bfloat16"
 load_in_4bit = false
-load_in_8bit = false
+load_in_8bit = true
 attn_implementation = "eager"
 enable_thinking = true
 profile_cache = true
