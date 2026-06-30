@@ -1,0 +1,5 @@
+run_id,step_index,call_index,agent_name,llm_type,model,selected_tool,input_tokens,output_tokens,output_tokens_including_think,llm_latency_sec,tool_latency_sec,finish_reason
+20260629_204312_652813,,,default,main,gpt-5,,432,1508,1508,17.758718,,stop
+20260629_204312_652813,0,0,profiled_qwen,sub,Qwen/Qwen3-14B,web_search,1900,35,760,556.593373,2.057715,
+20260629_204312_652813,0,1,profiled_qwen,sub,Qwen/Qwen3-14B,terminate,2937,72,686,670.399679,,
+20260629_204312_652813,0,2,profiled_qwen,sub,Qwen/Qwen3-14B,terminate,3641,23,398,632.422602,0.000070,
